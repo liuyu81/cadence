@@ -345,6 +345,13 @@ func (s *shardContextImpl) UpdateTimerMaxReadLevel(cluster string) time.Time {
 
 func (s *shardContextImpl) CreateWorkflowExecution(request *persistence.CreateWorkflowExecutionRequest) (
 	*persistence.CreateWorkflowExecutionResponse, error) {
+
+	// do not try to get domain cache within shard lock
+	domainEntry, err := s.domainCache.GetDomainByID(request.DomainID)
+	if err != nil {
+		return nil, err
+	}
+
 	s.Lock()
 	defer s.Unlock()
 
@@ -374,7 +381,7 @@ func (s *shardContextImpl) CreateWorkflowExecution(request *persistence.CreateWo
 
 	defer s.updateMaxReadLevelLocked(transferMaxReadLevel)
 
-	err := s.allocateTimerIDsLocked(request.TimerTasks, request.DomainID, request.Execution.GetWorkflowId())
+	err = s.allocateTimerIDsLocked(domainEntry, request.TimerTasks, request.DomainID, request.Execution.GetWorkflowId())
 	if err != nil {
 		return nil, err
 	}
@@ -426,20 +433,18 @@ Create_Loop:
 	return nil, ErrMaxAttemptsExceeded
 }
 
-func (s *shardContextImpl) getDefaultEncoding(domainID string) (common.EncodingType, error) {
-	dm, err := s.domainCache.GetDomainByID(domainID)
-	if err != nil {
-		return "", err
-	}
-	return common.EncodingType(s.config.EventEncodingType(dm.GetInfo().Name)), nil
+func (s *shardContextImpl) getDefaultEncoding(domainEntry *cache.DomainCacheEntry) common.EncodingType {
+	return common.EncodingType(s.config.EventEncodingType(domainEntry.GetInfo().Name))
 }
 
 func (s *shardContextImpl) UpdateWorkflowExecution(request *persistence.UpdateWorkflowExecutionRequest) (*persistence.UpdateWorkflowExecutionResponse, error) {
-	encoding, err := s.getDefaultEncoding(request.ExecutionInfo.DomainID)
+
+	// do not try to get domain cache within shard lock
+	domainEntry, err := s.domainCache.GetDomainByID(request.ExecutionInfo.DomainID)
 	if err != nil {
 		return nil, err
 	}
-	request.Encoding = encoding
+	request.Encoding = s.getDefaultEncoding(domainEntry)
 
 	s.Lock()
 	defer s.Unlock()
@@ -489,14 +494,14 @@ func (s *shardContextImpl) UpdateWorkflowExecution(request *persistence.UpdateWo
 			transferMaxReadLevel = id
 		}
 
-		err = s.allocateTimerIDsLocked(request.ContinueAsNew.TimerTasks, request.ExecutionInfo.DomainID, request.ExecutionInfo.WorkflowID)
+		err = s.allocateTimerIDsLocked(domainEntry, request.ContinueAsNew.TimerTasks, request.ExecutionInfo.DomainID, request.ExecutionInfo.WorkflowID)
 		if err != nil {
 			return nil, err
 		}
 	}
 	defer s.updateMaxReadLevelLocked(transferMaxReadLevel)
 
-	err = s.allocateTimerIDsLocked(request.TimerTasks, request.ExecutionInfo.DomainID, request.ExecutionInfo.WorkflowID)
+	err = s.allocateTimerIDsLocked(domainEntry, request.TimerTasks, request.ExecutionInfo.DomainID, request.ExecutionInfo.WorkflowID)
 	if err != nil {
 		return nil, err
 	}
@@ -547,11 +552,12 @@ Update_Loop:
 }
 
 func (s *shardContextImpl) ResetMutableState(request *persistence.ResetMutableStateRequest) error {
-	encoding, err := s.getDefaultEncoding(request.ExecutionInfo.DomainID)
+	// do not try to get domain cache within shard lock
+	domainEntry, err := s.domainCache.GetDomainByID(request.ExecutionInfo.DomainID)
 	if err != nil {
 		return err
 	}
-	request.Encoding = encoding
+	request.Encoding = s.getDefaultEncoding(domainEntry)
 
 	s.Lock()
 	defer s.Unlock()
@@ -602,11 +608,13 @@ Reset_Loop:
 }
 
 func (s *shardContextImpl) AppendHistoryV2Events(request *persistence.AppendHistoryNodesRequest, domainID string) (int, error) {
-	encoding, err := s.getDefaultEncoding(domainID)
+
+	domainEntry, err := s.domainCache.GetDomainByID(domainID)
 	if err != nil {
 		return 0, err
 	}
-	request.Encoding = encoding
+	request.Encoding = s.getDefaultEncoding(domainEntry)
+
 	size := 0
 	defer func() {
 		s.metricsClient.RecordTimer(metrics.SessionSizeStatsScope, metrics.HistorySize, time.Duration(size))
@@ -619,11 +627,12 @@ func (s *shardContextImpl) AppendHistoryV2Events(request *persistence.AppendHist
 }
 
 func (s *shardContextImpl) AppendHistoryEvents(request *persistence.AppendHistoryEventsRequest) (int, error) {
-	encoding, err := s.getDefaultEncoding(request.DomainID)
+
+	domainEntry, err := s.domainCache.GetDomainByID(request.DomainID)
 	if err != nil {
 		return 0, err
 	}
-	request.Encoding = encoding
+	request.Encoding = s.getDefaultEncoding(domainEntry)
 
 	size := 0
 	defer func() {
@@ -841,14 +850,16 @@ func (s *shardContextImpl) emitShardInfoMetricsLogsLocked() {
 	s.metricsClient.RecordTimer(metrics.ShardInfoScope, metrics.ShardInfoTimerFailoverInProgressTimer, time.Duration(timerFailoverInProgress))
 }
 
-func (s *shardContextImpl) allocateTimerIDsLocked(timerTasks []persistence.Task, domainID, workflowID string) error {
+func (s *shardContextImpl) allocateTimerIDsLocked(domainEntry *cache.DomainCacheEntry, timerTasks []persistence.Task, domainID, workflowID string) error {
 	// assign IDs for the timer tasks. They need to be assigned under shard lock.
-	clusterMetadata := s.GetService().GetClusterMetadata()
 	cluster := s.currentCluster
 	for _, task := range timerTasks {
 		ts := task.GetVisibilityTimestamp()
 		if task.GetVersion() != common.EmptyVersion {
-			cluster = clusterMetadata.ClusterNameForFailoverVersion(task.GetVersion())
+			// cannot use version to determine the corresponding cluster for timer task
+			// this is because during failover, timer task should be created as active
+			// or otherwise, failover + active processing logic may not pick up the task.
+			cluster = domainEntry.GetReplicationConfig().ActiveClusterName
 		}
 		readCursorTS := s.timerMaxReadLevelMap[cluster]
 		if ts.Before(readCursorTS) {

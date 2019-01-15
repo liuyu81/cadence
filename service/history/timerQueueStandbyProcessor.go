@@ -141,7 +141,6 @@ func (t *timerQueueStandbyProcessorImpl) process(timerTask *persistence.TimerTas
 	if err != nil {
 		return metrics.TimerStandbyQueueProcessorScope, err
 	} else if !ok {
-		t.timerQueueAckMgr.completeTimerTask(timerTask)
 		return metrics.TimerStandbyQueueProcessorScope, nil
 	}
 
